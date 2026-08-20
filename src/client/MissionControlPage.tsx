@@ -16,12 +16,12 @@ import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } fro
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionFace } from '@deepseek-ai/dsh-client-runtime/client'
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
-import { PANE_DRAG_MIME } from './drag.ts'
+import { PANE_DRAG_MIME, setDraggedSessionId } from './drag.ts'
 import { fetchGitInfo, type GitInfo } from './git-info.ts'
 import {
   addPane, FALLBACK_PANE_SIZE, getPaneRevision, getPaneRow, getPaneSize, getPanes,
   MIN_PANE_HEIGHT, MIN_PANE_WIDTH, PANE_GAP, reflowRows, removePane, setPaneSize,
-  subscribePanes, type PaneRow, type PaneSize,
+  spreadEvenly, subscribePanes, type PaneRow, type PaneSize,
 } from './pane-store.ts'
 import { MiniChatPane } from './MiniChatPane.tsx'
 
@@ -38,11 +38,13 @@ export interface MissionControlPageInjected {
   readonly getModelDirectory: (sessionId: string) => ModelDirectory | undefined
   readonly listCommands: (sessionId: string) => Promise<readonly PaneCommand[]>
   readonly openInMain: (sessionId: string) => void
+  /** Create (or reuse a blank) session in a workspace; returns the new session id. */
+  readonly createSession: (workspaceId: string) => Promise<string | undefined>
 }
 
-/** Full props of the Mission Control main page. */
+/** Full props of the Mission Control view. */
 export type MissionControlPageProps =
-  PropsRuntime<'main.page'>
+  PropsRuntime<'conversation.view'>
   & InjectFace<MissionControlPageInjected>
 
 const DROP_PREVIEW_CSS = `
@@ -323,6 +325,7 @@ function ResizablePane({ sessionId, title, cwd, row, defaultSize, rowHeight, onC
     }
     event.dataTransfer.setData(PANE_DRAG_MIME, sessionId)
     event.dataTransfer.effectAllowed = 'move'
+    setDraggedSessionId(sessionId)
     const frame = frameRef.current
     if (frame !== null) {
       const rect = frame.getBoundingClientRect()
@@ -392,6 +395,8 @@ function ResizablePane({ sessionId, title, cwd, row, defaultSize, rowHeight, onC
           background: 'var(--dsw-alias-bg-layer-2, #f6f8fa)',
           flexShrink: 0,
           cursor: 'grab',
+          userSelect: 'none',
+          WebkitUserSelect: 'none',
         }}
       >
         <strong
@@ -581,18 +586,77 @@ function ResizablePane({ sessionId, title, cwd, row, defaultSize, rowHeight, onC
 
 /** Mission Control page with a row-based pane layout. */
 export function MissionControlPage({
-  useSessions, getSession, getModelDirectory, listCommands, openInMain,
+  useSessions, useWorkspaces, getSession, getModelDirectory, listCommands, openInMain, createSession,
 }: MissionControlPageProps) {
   const sessions = useSessions(s => s)
+  const workspaces = useWorkspaces(s => s)
+  // Synchronous create lock: React state updates are async, so a rapid double
+  // click could slip past `if (creating)` before the disabled attribute lands.
+  // A ref gives a hard, immediate guard against double-creating sessions.
+  const [creating, setCreating] = useState(false)
+  const creatingRef = useRef(false)
+  const [createError, setCreateError] = useState<string | null>(null)
+  // While Mission Control is the active view, the main conversation's
+  // bottom composer bar is still rendered below the pane grid and eats a
+  // large slice of vertical space. Hide it for the lifetime of this view.
+  //
+  // Defense in depth (AGY + Claude Code review): the rule is scoped under
+  // body[data-mcp-grid-active] — which this component sets on mount and
+  // clears on unmount — so even if the <style> tag somehow survives (HMR
+  // or abnormal unmount), it only takes effect while the MC grid actually
+  // exists. A stale tag on the Chat view is inert instead of harmful.
+  useEffect(() => {
+    // Idempotent guard: drop any previously injected tag before mounting,
+    // so HMR / double-mount can never leave orphan styles behind.
+    document.querySelectorAll('style[data-mcp-hide-main-composer]').forEach(el => el.remove())
+
+    const tag = document.createElement('style')
+    tag.dataset.mcpHideMainComposer = 'true'
+    tag.textContent = `body[data-mcp-grid-active] [data-slot="conversation.composer.bar"] { display: none !important; }`
+    document.head.append(tag)
+    document.body.dataset.mcpGridActive = 'true'
+    return () => {
+      delete document.body.dataset.mcpGridActive
+      tag.remove()
+    }
+  }, [])
   // Row/height changes keep the pane list reference identical, so this
   // revision subscription is the render trigger for row re-parenting.
   const paneRevision = useSyncExternalStore(subscribePanes, getPaneRevision, () => 0)
   const panes = useSyncExternalStore(subscribePanes, getPanes, getPanes)
   const gridRef = useRef<HTMLDivElement>(null)
   const [viewport, setViewport] = useState<GridViewport | null>(null)
+  // Sessions the user can still add as a pane. Mirrors the sidebar's
+  // visibility (sessionVisible) so the dropdown is its strict subset minus
+  // panes already open: hide subagent children, archived sessions, and
+  // blank drafts that aren't the current session. Ordered newest-first by
+  // updatedAt (id as deterministic tiebreak) to match the sidebar's recency
+  // sort — picking a session is then predictable.
+  const archivedIds = useMemo(
+    () => new Set(workspaces.archivedSessionIds),
+    [workspaces.archivedSessionIds],
+  )
   const availableIds = useMemo(
-    () => sessions.ids.filter(id => !panes.includes(id)),
-    [sessions.ids, panes],
+    () => sessions.ids
+      .filter((id) => {
+        if (panes.includes(id)) return false
+        const summary = sessions.byId[id]
+        if (summary === undefined) return false
+        if (summary.origin === 'subagent') return false
+        if (archivedIds.has(id)) return false
+        if (summary.blank && summary.id !== sessions.current) return false
+        return true
+      })
+      .sort((a, b) => {
+        const aSummary = sessions.byId[a]
+        const bSummary = sessions.byId[b]
+        const aTime = aSummary?.updatedAt ?? 0
+        const bTime = bSummary?.updatedAt ?? 0
+        if (bTime !== aTime) return bTime - aTime
+        if (a === b) return 0
+        return a < b ? -1 : 1
+      }),
+    [sessions.ids, sessions.byId, panes, archivedIds, sessions.current],
   )
   const availableKey = availableIds.join('\u0000')
   const [selected, setSelected] = useState('')
@@ -621,6 +685,36 @@ export function MissionControlPage({
     if (viewport === null || panes.length === 0) return
     reflowRows(viewport.width)
   }, [paneRevision, panes, viewport])
+
+  // Create a brand-new conversation and open it as a pane. Prefer the
+  // workspace of the current session, then the most recent workspace, then
+  // the first listed one; with no workspace at all the button is disabled.
+  const handleNewSession = async (): Promise<void> => {
+    if (creatingRef.current) return
+    creatingRef.current = true
+    setCreating(true)
+    setCreateError(null)
+    try {
+      const currentId = sessions.current
+      const currentWorkspace = currentId === undefined
+        ? undefined
+        : workspaces.items.find(w => w.sessionIds.includes(currentId))
+      const workspace = currentWorkspace ?? workspaces.items[0]
+      if (workspace === undefined) {
+        setCreateError('No workspace available to create a session in.')
+        return
+      }
+      const sessionId = await createSession(workspace.workspaceId as unknown as string)
+      if (sessionId === undefined) {
+        setCreateError('Failed to create a new session.')
+        return
+      }
+      addPane(sessionId)
+    } finally {
+      creatingRef.current = false
+      setCreating(false)
+    }
+  }
 
   const rowMap = new Map<number, string[]>()
   for (const id of panes) {
@@ -705,48 +799,108 @@ export function MissionControlPage({
         }}
       >
         <h1 style={{ fontSize: 20, margin: 0, fontWeight: 600 }}>Mission Control</h1>
-        {availableIds.length > 0 && (
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <select
-              data-mcp-picker
-              value={selected}
-              onChange={event => setSelected(event.target.value)}
-              style={{
-                padding: '4px 8px',
-                fontSize: 13,
-                background: 'var(--dsw-alias-bg-layer-2, #fff)',
-                color: 'var(--dsw-alias-label-primary, #1f2328)',
-                border: '1px solid var(--dsw-alias-border-l2, #d0d7de)',
-                borderRadius: 6,
-              }}
-            >
-              {availableIds.map((id) => {
-                const summary = sessions.byId[id]
-                const label = summary?.title ?? summary?.displayTitle ?? id
-                return <option key={id} value={id}>{label}</option>
-              })}
-            </select>
-            <button
-              type="button"
-              data-mcp-add-pane
-              disabled={selected === ''}
-              onClick={() => addPane(selected)}
-              style={{
-                padding: '4px 10px',
-                fontSize: 13,
-                cursor: 'pointer',
-                background: 'var(--dsw-alias-button-primary-fill, #1f2328)',
-                color: 'var(--dsw-alias-button-primary-foreground, #fff)',
-                border: 0,
-                borderRadius: 6,
-                fontWeight: 600,
-              }}
-            >
-              Add
-            </button>
-          </div>
-        )}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {availableIds.length > 0 && (
+            <>
+              <select
+                data-mcp-picker
+                value={selected}
+                onChange={event => setSelected(event.target.value)}
+                style={{
+                  padding: '4px 8px',
+                  fontSize: 13,
+                  background: 'var(--dsw-alias-bg-layer-2, #fff)',
+                  color: 'var(--dsw-alias-label-primary, #1f2328)',
+                  border: '1px solid var(--dsw-alias-border-l2, #d0d7de)',
+                  borderRadius: 6,
+                }}
+              >
+                {availableIds.map((id) => {
+                  const summary = sessions.byId[id]
+                  const label = summary?.title ?? summary?.displayTitle ?? id
+                  return <option key={id} value={id}>{label}</option>
+                })}
+              </select>
+              <button
+                type="button"
+                data-mcp-add-pane
+                disabled={selected === ''}
+                onClick={() => addPane(selected)}
+                style={{
+                  padding: '4px 10px',
+                  fontSize: 13,
+                  cursor: 'pointer',
+                  background: 'var(--dsw-alias-button-primary-fill, #1f2328)',
+                  color: 'var(--dsw-alias-button-primary-foreground, #fff)',
+                  border: 0,
+                  borderRadius: 6,
+                  fontWeight: 600,
+                }}
+              >
+                Add
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            data-mcp-new-session
+            disabled={creating || workspaces.items.length === 0}
+            onClick={() => { void handleNewSession() }}
+            style={{
+              padding: '4px 10px',
+              fontSize: 13,
+              cursor: 'pointer',
+              background: 'var(--dsw-alias-button-primary-dimmed, #e8f0fe)',
+              color: 'var(--dsw-alias-label-primary, #1f2328)',
+              border: '1px solid var(--dsw-alias-border-l2, #d0d7de)',
+              borderRadius: 6,
+              fontWeight: 600,
+            }}
+          >
+            {creating ? 'Creating…' : '＋ 新会话'}
+          </button>
+          <button
+            type="button"
+            data-mcp-spread
+            disabled={panes.length === 0}
+            onClick={() => {
+              const grid = gridRef.current
+              if (grid === null) return
+              spreadEvenly(grid.clientWidth)
+            }}
+            title="Arrange all panes side by side in one row"
+            style={{
+              padding: '4px 10px',
+              fontSize: 13,
+              cursor: 'pointer',
+              background: 'var(--dsw-alias-bg-layer-2, #f6f8fa)',
+              color: 'var(--dsw-alias-label-primary, #1f2328)',
+              border: '1px solid var(--dsw-alias-border-l2, #d0d7de)',
+              borderRadius: 6,
+              fontWeight: 600,
+            }}
+          >
+            ⬌ 横排
+          </button>
+        </div>
       </div>
+      {createError !== null && (
+        <div
+          data-mcp-create-error
+          role="alert"
+          style={{
+            margin: '0 0 12px',
+            padding: '8px 12px',
+            fontSize: 12,
+            borderRadius: 6,
+            border: '1px solid var(--dsw-alias-state-error-primary, #d1242f)',
+            background: 'var(--dsw-alias-bg-mask-drop, rgba(209,36,47,0.06))',
+            color: 'var(--dsw-alias-state-error-primary, #d1242f)',
+          }}
+        >
+          {createError}
+        </div>
+      )}
       <div
         ref={gridRef}
         data-mcp-grid

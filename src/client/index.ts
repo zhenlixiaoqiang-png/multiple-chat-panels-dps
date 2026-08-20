@@ -1,23 +1,52 @@
 /**
  * multiple-chat-panels client entry.
  *
- * Registers the Mission Control first-level sidebar action, the matching
- * `main.page`, and the document-level drag/drop bridge that opens Mission
- * Control when a sidebar session is dropped onto the center column.
+ * rc.8 adapter: the plugin originally registered `sidebar.primary.action` +
+ * `main.page` and navigated with `ctx.layout.openPrimaryPage`, which rc.8
+ * removed. This registers Mission Control as a `conversation.view` ring entry
+ * (the official replace-the-chat-surface mechanism — the header grows a
+ * "Mission Control" tab) plus a `sidebar.footer.action` shortcut that opens
+ * it, following the same pattern the dsh-multi-chat wall uses on rc.8.
  */
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
-import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, SessionId, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { MissionControlNav, type MissionControlNavInjected } from './MissionControlNav.tsx'
 import { MissionControlPage, type MissionControlPageInjected } from './MissionControlPage.tsx'
-import { PANE_DRAG_MIME } from './drag.ts'
+import {
+  clearDraggedSessionId, getDraggedSessionId, PANE_DRAG_MIME,
+} from './drag.ts'
 import { getPaneSize, PANE_GAP, placePane, type PaneRow } from './pane-store.ts'
 
 export const PAGE_ID = 'mission-control'
 
-export const inject = ['slots', 'layout', 'sessions', 'modelDirectories', 'remote', 'remote.commands']
+// rc.8 inject list: 'remote' is the api-remotes client service that exposes
+// ctx.remote.commands (dotted sub-namespaces are NOT separate cordis services,
+// so 'remote.commands' must not be listed). 'layout' was dropped because the
+// rc.8 adapter no longer calls ctx.layout (view-ring tabs replace pages).
+// 'workspaces' backs the "new session" pane action (connectWorkspace).
+export const inject = ['slots', 'sessions', 'modelDirectories', 'remote', 'workspaces']
+
+/** The Mission Control view-ring tab label (also used to find the tab to click). */
+export function missionControlTabLabel(): string {
+  return 'Mission Control'
+}
+
+/** Find the conversation view-ring tab by label and click it (official view-ring switch). */
+export function clickViewTabByLabel(label: string): void {
+  const tab = Array.from(document.querySelectorAll<HTMLButtonElement>('[role="tablist"] [role="tab"]'))
+    .find(el => el.textContent?.trim() === label)
+  tab?.click()
+}
+
+/** Switch the view ring back to the default chat tab (the first tab). */
+export function switchToChatView(): void {
+  const tab = document.querySelector<HTMLButtonElement>('[role="tablist"] [role="tab"]')
+  tab?.click()
+}
 
 function isCenterTarget(target: EventTarget | null): boolean {
   return target instanceof Element && target.closest('[class*="centerSurface"]') !== null
@@ -89,19 +118,26 @@ function clearDropPreview(): void {
 }
 
 export function apply(ctx: ClientContext): void {
-  ctx.slots.inject('sidebar.primary.action', () => ctx.slots.register({
-    name: 'sidebar.primary.action',
+  // The sidebar footer shortcut: jumps to the Mission Control view. It owns
+  // no state — the view ring decides what renders — so it is a plain action
+  // row (rc.8 pattern, mirrors dsh-multi-chat's WallToggle).
+  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
+    name: 'sidebar.footer.action',
     id: PAGE_ID,
-    order: 30,
+    order: 10,
     inject: (): MissionControlNavInjected => ({
-      pageId: PAGE_ID,
-      open: () => { ctx.layout.openPrimaryPage(PAGE_ID) },
+      open: () => { clickViewTabByLabel(missionControlTabLabel()) },
     }),
   }, MissionControlNav))
 
-  ctx.slots.inject('main.page', () => ctx.slots.register({
-    name: 'main.page',
-    key: PAGE_ID,
+  // Mission Control itself: a 'conversation.view' ring entry. The header
+  // projects the tab from the registration options; selecting it swaps the
+  // right panel from the chat to the panes (official view-ring behavior).
+  ctx.slots.inject('conversation.view', () => ctx.slots.register({
+    name: 'conversation.view',
+    id: PAGE_ID,
+    order: 20,
+    label: () => missionControlTabLabel(),
     inject: (): MissionControlPageInjected => ({
       getSession: (sessionId) => ctx.sessions.binding(sessionId as SessionId)?.session,
       getModelDirectory: (sessionId): ModelDirectory | undefined => {
@@ -126,17 +162,41 @@ export function apply(ctx: ClientContext): void {
       },
       openInMain: (sessionId) => {
         ctx.sessions.open(sessionId as SessionId)
-        ctx.layout.closePrimaryPage()
+        switchToChatView()
+      },
+      // Create a brand-new session in the given workspace and return its id.
+      // Uses sessions.create (NOT workspaces.connectWorkspace) so every click
+      // yields a genuinely new conversation — connectWorkspace would instead
+      // reuse the workspace's existing blank session, making repeated "new
+      // session" clicks no-ops while a blank pane is still unused.
+      //
+      // Note: `create` lives on the concrete SessionRuntime class, not on the
+      // ISessions contract `ctx.sessions` types to (rc.8), so the cast is
+      // deliberate; SessionRuntime.create resolves to the session id directly
+      // (throws SessionCreateError on failure) — NOT an {ok, value} envelope.
+      createSession: async (workspaceId): Promise<string | undefined> => {
+        try {
+          const runtime = ctx.sessions as unknown as { create(opts: { workspaceId: WorkspaceId }): Promise<SessionId> }
+          return await runtime.create({ workspaceId: workspaceId as WorkspaceId }) as unknown as string
+        } catch (error) {
+          console.error('[multiple-chat-panels] create session failed:', error)
+          return undefined
+        }
       },
     }),
   }, MissionControlPage))
 
+  // HTML5 DnD forbids reading getData() during dragover (returns ""), which
+  // made width checks and target resolution unreliable and could visually
+  // reject every drop ("拉不动"). The dragged session id lives at module
+  // scope (setDraggedSessionId from startPaneDrag) so dragover/drop can read
+  // it; cleared on dragend/drop.
+
   const onDragOver = (event: DragEvent): void => {
     if (!isCenterTarget(event.target)) return
     if (event.dataTransfer === null) return
-    if (!event.dataTransfer.types.includes('text/plain') && !event.dataTransfer.types.includes(PANE_DRAG_MIME)) return
-    event.preventDefault()
     if (!event.dataTransfer.types.includes(PANE_DRAG_MIME)) return
+    event.preventDefault()
     const grid = document.querySelector('[data-mcp-grid]')
     if (grid === null) return
     const row = rowForDrop(grid, event.clientY)
@@ -150,9 +210,9 @@ export function apply(ctx: ClientContext): void {
       grid.dataset.mcpNewRow = '1'
       return
     }
-    const draggedId = event.dataTransfer.getData(PANE_DRAG_MIME)
+    const draggedId = getDraggedSessionId()
     const before = beforeIdForDrop(target, event.clientX, draggedId)
-    const draggedPane = document.querySelector(`[data-mcp-session="${CSS.escape(draggedId)}"]`)
+    const draggedPane = draggedId === '' ? null : document.querySelector(`[data-mcp-session="${CSS.escape(draggedId)}"]`)
     const draggedWidth = draggedPane === null
       ? getPaneSize(draggedId)?.width ?? 360
       : draggedPane.getBoundingClientRect().width
@@ -168,11 +228,12 @@ export function apply(ctx: ClientContext): void {
     if (event.dataTransfer === null) return
     const paneDragged = event.dataTransfer.types.includes(PANE_DRAG_MIME)
     const dragged = paneDragged
-      ? event.dataTransfer.getData(PANE_DRAG_MIME)
+      ? (getDraggedSessionId() || event.dataTransfer.getData(PANE_DRAG_MIME))
       : event.dataTransfer.getData('text/plain')
     if (dragged === '') return
     event.preventDefault()
     clearDropPreview()
+    clearDraggedSessionId()
     const current = ctx.sessions.list.getSnapshot().current
     const grid = document.querySelector('[data-mcp-grid]')
     if (grid === null) {
@@ -186,26 +247,27 @@ export function apply(ctx: ClientContext): void {
         ? current
         : undefined
       placePane(dragged, 0, before)
-      ctx.layout.openPrimaryPage(PAGE_ID)
+      clickViewTabByLabel(missionControlTabLabel())
       return
     }
     const row = rowForDrop(grid, event.clientY)
     const rowElement = gridRowElement(grid, row)
     const before = rowElement === null ? undefined : beforeIdForDrop(rowElement, event.clientX, dragged)
-    if (paneDragged && rowElement !== null) {
-      const draggedPane = document.querySelector(`[data-mcp-session="${CSS.escape(dragged)}"]`)
-      const draggedWidth = draggedPane === null
-        ? getPaneSize(dragged)?.width ?? 360
-        : draggedPane.getBoundingClientRect().width
-      if (!rowFitsAfterInsert(rowElement, dragged, draggedWidth, before)) return
-    }
+    // No hard width rejection on drop: let the pane land where the user
+    // dropped it and let reflowRows settle the layout (a rejected drop is
+    // exactly the "can't drag" symptom users report).
     placePane(dragged, row, before)
+  }
+
+  const onDragEnd = (): void => {
+    clearDraggedSessionId()
+    clearDropPreview()
   }
 
   ctx.effect(() => {
     document.addEventListener('dragover', onDragOver)
     document.addEventListener('drop', onDrop)
-    document.addEventListener('dragend', clearDropPreview)
+    document.addEventListener('dragend', onDragEnd)
     return () => {
       document.removeEventListener('dragover', onDragOver)
       document.removeEventListener('drop', onDrop)

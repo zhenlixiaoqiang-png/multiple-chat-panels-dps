@@ -10,14 +10,14 @@
  * toolbar, and a bottom-anchored composer so it stays usable at pane scale.
  */
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { bindSnapshotSelector } from '@deepseek-ai/dsh-client-web-react'
 import { MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type {
   AssistantBlock, CommandNode, ConversationNode, ConversationSnapshot, PartialAssistant, SessionFace, ToolResultNode,
 } from '@deepseek-ai/dsh-client-runtime/client'
 import {
-  getComposerHeight, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_HEIGHT, setComposerHeight, subscribePanes,
+  getComposerCollapsed, getComposerHeight, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_HEIGHT, setComposerCollapsed,
+  setComposerHeight, subscribePanes,
 } from './pane-store.ts'
 import { PaneToolbar } from './PaneToolbar.tsx'
 
@@ -26,6 +26,31 @@ export interface PaneCommand {
   readonly name: string
   readonly description: string
   readonly hint?: string
+}
+
+/**
+ * rc.8 adapter: `bindSnapshotSelector` was previously imported from
+ * `@deepseek-ai/dsh-client-web-react`, which the rc.8 front-end merged away.
+ * Inline equivalent: bind a bare observable (SessionFace) to a uSES selector
+ * hook. Uses only `useSyncExternalStore` from react (a platform seed word),
+ * so it resolves on every DSH version without an external package.
+ *
+ * Hooks-safety fix (Claude Code review): the original code called the hook
+ * conditionally (`useSessionSnapshot === null ? null : useSessionSnapshot(s => s)`),
+ * which violates the Rules of Hooks when `session` flips from undefined to a
+ * SessionFace (hook count changes mid-lifetime → "Rendered more hooks").
+ * This version ALWAYS invokes `useSyncExternalStore` — with a no-op
+ * subscribe and a null snapshot when `session` is undefined — so the hook
+ * count stays constant across renders.
+ */
+function bindSnapshotSelector<T>(w: { subscribe(fn: () => void): () => void; getSnapshot(): T } | undefined) {
+  const subscribe = (fn: () => void) => (w === undefined ? () => {} : w.subscribe(fn))
+  const getSnapshot = () => (w === undefined ? null : w.getSnapshot()) as T | null
+  return function useSelector(sel?: (s: T) => unknown): T | null {
+    const snap = useSyncExternalStore(subscribe, getSnapshot, () => null)
+    if (snap === null) return null
+    return sel === undefined ? (snap as T) : (sel(snap as T) as unknown as T | null)
+  }
 }
 
 interface MiniChatPaneProps {
@@ -66,6 +91,10 @@ function bytesToBase64(data: Uint8Array): string {
 }
 
 const PANE_CSS = `
+@keyframes mcp-running-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
 [data-mcp-chat] pre {
   margin: 4px 0;
   padding: 8px;
@@ -251,16 +280,23 @@ export function MiniChatPane({ sessionId, session, directory, listCommands, open
     () => MIN_COMPOSER_HEIGHT,
   )
   const composerHeight = composerLive ?? manualComposerHeight
+  const composerCollapsed = useSyncExternalStore(
+    subscribePanes,
+    () => getComposerCollapsed(sessionId),
+    () => false,
+  )
   const [attachments, setAttachments] = useState<readonly PaneAttachment[]>([])
+  const attachmentsRef = useRef(attachments)
+  attachmentsRef.current = attachments
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // Always call the hook (even when session is undefined) so the hook count
+  // stays constant across renders — see bindSnapshotSelector above.
   const useSessionSnapshot = useMemo(
-    () => (session === undefined ? null : bindSnapshotSelector(session)),
+    () => bindSnapshotSelector(session),
     [session],
   )
-  const snapshot: ConversationSnapshot | null = useSessionSnapshot === null
-    ? null
-    : useSessionSnapshot(s => s)
+  const snapshot = useSessionSnapshot(s => s)
 
   useEffect(() => {
     if (session === undefined) return
@@ -283,13 +319,25 @@ export function MiniChatPane({ sessionId, session, directory, listCommands, open
     setSlashDismissed(false)
   }, [draft])
 
+  // Collapsing unmounts the composer internals; if a resize drag was in
+  // flight its pointer handlers never fire, so clear the stale drag state
+  // (otherwise composerLive would pin a stale height on the next expand).
+  useEffect(() => {
+    if (composerCollapsed) {
+      composerDragRef.current = null
+      setComposerLive(null)
+    }
+  }, [composerCollapsed])
+
   useLayoutEffect(() => {
     const input = inputRef.current
     if (input === null) return
     input.style.height = 'auto'
     const naturalHeight = Math.min(input.scrollHeight, COMPOSER_LINE_HEIGHT * COMPOSER_MAX_ROWS + 12)
     input.style.height = `${Math.max(naturalHeight, composerHeight)}px`
-  }, [composerHeight, draft])
+    // composerCollapsed in deps: on expand the textarea remounts and the effect
+    // must re-run to restore its height (otherwise it falls back to rows=2).
+  }, [composerHeight, draft, composerCollapsed])
 
   const slashQuery = draft.startsWith('/') && !draft.includes(' ') ? draft.slice(1) : null
   const slashOpen = slashQuery !== null && !slashDismissed
@@ -335,6 +383,13 @@ export function MiniChatPane({ sessionId, session, directory, listCommands, open
     setAttachments(prev => prev.filter(attachment => attachment.id !== id))
   }
 
+  // Revoke preview object URLs on unmount so draft attachments never leak.
+  useEffect(() => {
+    return () => {
+      for (const attachment of attachmentsRef.current) URL.revokeObjectURL(attachment.previewUrl)
+    }
+  }, [])
+
   const submit = (event: React.FormEvent): void => {
     event.preventDefault()
     const text = draft.trim()
@@ -358,7 +413,21 @@ export function MiniChatPane({ sessionId, session, directory, listCommands, open
         ...imageParts,
         ...(text === '' ? [] : [{ type: 'text' as const, text }]),
       ]
-      await session.prompt(content, 'queue')
+      // Delivery mode mirrors the main conversation: a plain send while the
+      // agent is idle queues normally, but while it is thinking/tool-running
+      // the message is delivered as a steer — the agent sees it immediately
+      // and can react (e.g. be corrected mid-turn) instead of waiting for the
+      // turn to finish. Matches the "interject while busy" behavior the user
+      // has in the main chat.
+      //
+      // Steer is best-effort (like the main composer policy): if the host
+      // rejects it (e.g. the delivery window just closed — steer-unavailable),
+      // fall back to queueing so the message is never silently dropped.
+      const mode = running ? 'steer' : 'queue'
+      const result = await session.prompt(content, mode)
+      if (!result.ok && mode === 'steer') {
+        await session.prompt(content, 'queue')
+      }
       for (const attachment of attachments) URL.revokeObjectURL(attachment.previewUrl)
       setAttachments([])
       setDraft('')
@@ -624,7 +693,7 @@ export function MiniChatPane({ sessionId, session, directory, listCommands, open
                   <button
                     type="button"
                     aria-label={`Remove queued message ${item.preview}`}
-                    onClick={() => { void session?.updateQueue(item.id, { kind: 'remove' } as never) }}
+                    onClick={() => { void session?.updateQueue(item.id, { kind: 'remove' }) }}
                     style={{ border: 0, background: 'transparent', cursor: 'pointer' }}
                   >
                     ×
@@ -659,14 +728,59 @@ export function MiniChatPane({ sessionId, session, directory, listCommands, open
         data-mcp-composer
         style={{
           borderTop: '1px solid var(--dsw-alias-border-l2, #d0d7de)',
-          padding: 8,
-          minHeight: composerHeight,
+          padding: composerCollapsed ? 0 : 8,
+          minHeight: composerCollapsed ? 26 : composerHeight,
           boxSizing: 'border-box',
           background: 'var(--dsw-alias-bg-layer-1, #fff)',
           flexShrink: 0,
           position: 'relative',
+          display: 'flex',
+          alignItems: 'center',
         }}
       >
+        <button
+          type="button"
+          data-mcp-composer-toggle
+          aria-label={composerCollapsed ? 'Expand composer' : 'Collapse composer'}
+          aria-expanded={composerCollapsed ? 'false' : 'true'}
+          title={composerCollapsed ? 'Expand input box' : 'Collapse input box'}
+          onClick={() => setComposerCollapsed(sessionId, !composerCollapsed)}
+          style={{
+            position: 'absolute',
+            top: 4,
+            right: 8,
+            width: 24,
+            height: 20,
+            borderRadius: 6,
+            border: '1px solid var(--dsw-alias-border-l2, #d0d7de)',
+            background: 'var(--dsw-alias-bg-layer-1, #fff)',
+            color: 'var(--dsw-alias-label-primary, #1f2328)',
+            cursor: 'pointer',
+            fontSize: 11,
+            lineHeight: 1,
+            padding: 0,
+            zIndex: 5,
+          }}
+        >
+          {composerCollapsed ? '▴' : '▾'}
+        </button>
+        {composerCollapsed && running && (
+          <span
+            data-mcp-running-dot
+            title="Agent is running"
+            style={{
+              marginLeft: 10,
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              background: 'var(--dsw-alias-state-warn-primary, #bf8700)',
+              flexShrink: 0,
+              animation: 'mcp-running-pulse 1.2s ease-in-out infinite',
+            }}
+          />
+        )}
+        {!composerCollapsed && (
+        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
         <div
           data-mcp-composer-resize
           aria-label="Resize composer"
@@ -911,6 +1025,8 @@ export function MiniChatPane({ sessionId, session, directory, listCommands, open
             </button>
           )}
         </form>
+        </div>
+        )}
       </div>
     </div>
   )

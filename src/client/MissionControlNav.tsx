@@ -1,27 +1,33 @@
 /**
- * Sidebar first-level action that opens the Mission Control main page.
+ * Sidebar footer shortcut that opens the Mission Control view.
+ *
+ * rc.8 adapter: previously a `sidebar.primary.action` entry with
+ * `PropsRuntime<'sidebar.primary.action'>`; rc.8 removed that slot, so this
+ * is now a `sidebar.footer.action` row (mirrors dsh-multi-chat's WallToggle).
+ * The click is a plain user-equivalent activation: it finds the header's
+ * view-ring tab for this plugin's label and clicks it, so the official
+ * view-ring state machine performs the switch. Session-scoped by design: the
+ * view ring only renders with an active session, so the shortcut is inert on
+ * the empty-hero screen — the user first opens or creates a session.
  */
 import React from 'react'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 
 /** Registration-side navigation action. */
 export interface MissionControlNavInjected {
-  readonly pageId: string
   readonly open: () => void
 }
 
-/** Full props of the sidebar first-level Mission Control entry. */
+/** Full props of the sidebar footer Mission Control entry. */
 export type MissionControlNavProps =
-  PropsRuntime<'sidebar.primary.action'>
+  PropsRuntime<'sidebar.footer.action'>
   & InjectFace<MissionControlNavInjected>
 
-/** First-level sidebar entry that opens the Mission Control page. */
-export function MissionControlNav({ wide, primaryPage, pageId, open }: MissionControlNavProps) {
-  const selected = primaryPage === pageId
+/** Sidebar footer entry that opens the Mission Control view. */
+export function MissionControlNav({ wide, open }: MissionControlNavProps) {
   return (
     <button
       type="button"
-      aria-current={selected ? 'page' : undefined}
       aria-label="Mission Control"
       title="Mission Control"
       onClick={open}

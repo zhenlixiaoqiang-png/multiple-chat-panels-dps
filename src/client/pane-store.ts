@@ -38,11 +38,14 @@ interface PaneState {
   sizes: Readonly<Record<string, PaneSize>>
   rows: Readonly<Record<string, PaneRow>>
   composerHeights: Readonly<Record<string, number>>
+  composerCollapsed: Readonly<Record<string, boolean>>
 }
 
 const listeners = new Set<() => void>()
 let state: PaneState = loadInitial()
 let revision = 0
+/** Set by spreadEvenly; suppresses reflowRows so a spread row stays one row (scrolls instead of wrapping). */
+let spreadLocked = false
 
 function readRaw(key: string): unknown {
   try {
@@ -92,6 +95,15 @@ function normalizeComposerHeights(value: unknown): Record<string, number> {
   return heights
 }
 
+function normalizeComposerCollapsed(value: unknown): Record<string, boolean> {
+  const collapsed: Record<string, boolean> = {}
+  if (typeof value !== 'object' || value === null) return collapsed
+  for (const [id, flag] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof flag === 'boolean') collapsed[id] = flag
+  }
+  return collapsed
+}
+
 function normalizePanes(value: unknown): readonly string[] {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is string => typeof item === 'string')
@@ -99,13 +111,14 @@ function normalizePanes(value: unknown): readonly string[] {
 
 function parseState(raw: unknown): PaneState | null {
   if (typeof raw !== 'object' || raw === null) return null
-  const record = raw as { panes?: unknown; sizes?: unknown; rows?: unknown; composerHeights?: unknown }
+  const record = raw as { panes?: unknown; sizes?: unknown; rows?: unknown; composerHeights?: unknown; composerCollapsed?: unknown }
   if (!Array.isArray(record.panes)) return null
   return {
     panes: normalizePanes(record.panes),
     sizes: normalizeSizes(record.sizes),
     rows: normalizeRows(record.rows),
     composerHeights: normalizeComposerHeights(record.composerHeights),
+    composerCollapsed: normalizeComposerCollapsed(record.composerCollapsed),
   }
 }
 
@@ -119,14 +132,14 @@ function loadInitial(): PaneState {
     const raw = readRaw(key)
     if (Array.isArray(raw)) {
       const panes = normalizePanes(raw)
-      if (panes.length > 0) return { panes, sizes: {}, rows: {}, composerHeights: {} }
+      if (panes.length > 0) return { panes, sizes: {}, rows: {}, composerHeights: {}, composerCollapsed: {} }
     }
     const parsed = parseState(raw)
     if (parsed !== null && parsed.panes.length > 0) {
-      return { panes: parsed.panes, sizes: {}, rows: {}, composerHeights: {} }
+      return { panes: parsed.panes, sizes: {}, rows: {}, composerHeights: {}, composerCollapsed: {} }
     }
   }
-  return { panes: [], sizes: {}, rows: {}, composerHeights: {} }
+  return { panes: [], sizes: {}, rows: {}, composerHeights: {}, composerCollapsed: {} }
 }
 
 function persist(): void {
@@ -166,6 +179,23 @@ export function getComposerHeight(sessionId: string): number {
   return state.composerHeights[sessionId] ?? MIN_COMPOSER_HEIGHT
 }
 
+/** Read the persisted collapsed flag of one pane's composer (absent = expanded). */
+export function getComposerCollapsed(sessionId: string): boolean {
+  return state.composerCollapsed[sessionId] ?? false
+}
+
+/** Toggle one pane's composer collapsed state (persisted per session). */
+export function setComposerCollapsed(sessionId: string, collapsed: boolean): void {
+  if (!state.panes.includes(sessionId)) return
+  if ((state.composerCollapsed[sessionId] ?? false) === collapsed) return
+  // No revision bump on purpose: the collapsed flag only affects per-pane
+  // composer rendering, not the grid layout — MissionControlPage re-runs
+  // reflowRows on revision changes, so bumping it would be a wasted reflow.
+  state = { ...state, composerCollapsed: { ...state.composerCollapsed, [sessionId]: collapsed } }
+  persist()
+  emit()
+}
+
 /** Subscribe to pane list, size, row, or composer-height changes. @returns disposer. */
 export function subscribePanes(listener: () => void): () => void {
   listeners.add(listener)
@@ -179,13 +209,18 @@ export function setPanes(next: readonly string[]): void {
   const sizes: Record<string, PaneSize> = {}
   const rows: Record<string, PaneRow> = {}
   const composerHeights: Record<string, number> = {}
+  const composerCollapsed: Record<string, boolean> = {}
   for (const id of next) {
     const size = state.sizes[id]
     if (size !== undefined) sizes[id] = size
     rows[id] = state.rows[id] ?? 0
     composerHeights[id] = state.composerHeights[id] ?? MIN_COMPOSER_HEIGHT
+    // Only persist the non-default (true) flag; absence means expanded,
+    // mirroring how sizes keep only explicitly-set entries.
+    if (state.composerCollapsed[id] === true) composerCollapsed[id] = true
   }
-  state = { panes: next, sizes, rows, composerHeights }
+  state = { panes: next, sizes, rows, composerHeights, composerCollapsed }
+  spreadLocked = false // pane set changed (add/remove/merge): release spread lock
   revision += 1
   persist()
   emit()
@@ -201,6 +236,7 @@ export function setPaneSize(sessionId: string, size: PaneSize): void {
     ...(top === 0 ? {} : { top }),
   }
   state = { ...state, sizes: { ...state.sizes, [sessionId]: clamped } }
+  spreadLocked = false // manual resize: user takes layout control back
   revision += 1
   persist()
   emit()
@@ -222,6 +258,7 @@ export function setPaneRow(sessionId: string, row: PaneRow): void {
   if (!state.panes.includes(sessionId)) return
   if (state.rows[sessionId] === row) return
   state = { ...state, rows: { ...state.rows, [sessionId]: row } }
+  spreadLocked = false // manual move: user takes layout control back
   revision += 1
   persist()
   emit()
@@ -262,6 +299,12 @@ function paneFitWidth(sessionId: string, count: number, viewportWidth: number): 
  */
 export function reflowRows(viewportWidth: number): void {
   if (!Number.isFinite(viewportWidth) || viewportWidth <= 0 || state.panes.length === 0) return
+  // After an explicit "横排" (spread) the user asked for one row; reflow
+  // would immediately split overflow back into multiple rows, silently
+  // undoing the spread. Skip while the spread lock is held (the row then
+  // scrolls horizontally instead of wrapping). Any manual layout change
+  // (drag, add, remove, resize) clears the lock.
+  if (spreadLocked) return
 
   const rows = new Map<number, string[]>()
   for (const id of state.panes) {
@@ -326,12 +369,42 @@ export function placePane(sessionId: string, row: PaneRow, beforeId?: string): v
   const composerHeights = state.composerHeights[sessionId] === undefined
     ? state.composerHeights
     : { ...state.composerHeights }
+  const composerCollapsed = state.composerCollapsed[sessionId] === undefined
+    ? state.composerCollapsed
+    : { ...state.composerCollapsed }
   state = {
     panes: next,
     sizes: state.sizes,
     rows: { ...state.rows, [sessionId]: row },
     composerHeights,
+    composerCollapsed,
   }
+  revision += 1
+  persist()
+  emit()
+}
+
+/**
+ * Arrange every pane on a single row, evenly split across the available
+ * width ("排排坐" horizontal layout). Persisted widths are overwritten so the
+ * row actually fits; heights keep their persisted values. This is the
+ * explicit horizontal-layout action behind the toolbar spread button.
+ * @param viewportWidth - available grid width in px.
+ */
+export function spreadEvenly(viewportWidth: number): void {
+  if (!Number.isFinite(viewportWidth) || viewportWidth <= 0 || state.panes.length === 0) return
+  const count = state.panes.length
+  const width = Math.max(MIN_PANE_WIDTH, Math.floor((viewportWidth - PANE_GAP * (count - 1)) / count))
+  const sizes: Record<string, PaneSize> = {}
+  for (const id of state.panes) {
+    const persisted = state.sizes[id]
+    const height = persisted?.height ?? FALLBACK_PANE_SIZE.height
+    sizes[id] = { width, height }
+  }
+  const rows: Record<string, PaneRow> = {}
+  for (const id of state.panes) rows[id] = 0
+  state = { ...state, sizes, rows }
+  spreadLocked = true
   revision += 1
   persist()
   emit()
