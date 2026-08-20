@@ -1,5 +1,22 @@
 # dsh-multiple-chat-panels
 
+> ## ⚡ 本 fork 说明（dps 适配版）
+>
+> 本仓库是 [WilliamShi666/dsh-multiple-chat-panels](https://github.com/WilliamShi666/dsh-multiple-chat-panels) 的 fork，针对 **DeepSeek Harness 0.1.0-rc.8** 做了适配与增强（原作者版本针对 rc.7，rc.8 前端重组后无法运行）。改动清单：
+>
+> - **rc.8 适配**：内联 `bindSnapshotSelector`（rc.8 移除 `dsh-client-web-react`）；入口改为 `sidebar.footer.action` + `conversation.view`（view-ring tab）；更新 tsdown externals 与 inject 清单
+> - **隐藏主对话底部输入框**：Mission Control 视图激活时自动隐藏主 composer，切回 Chat 恢复
+> - **面板输入框折叠**：每面板 composer 可折叠成细栏（per-session 持久化）
+> - **「＋ 新会话」按钮**：直接新建空白会话作为面板
+> - **Add 下拉排序**：按更新时间倒序 + 与侧边栏一致的可见性过滤（隐藏子代理/已归档/空白草稿）
+> - **「⬌ 横排」按钮**：所有面板强制单行均分横排（超出时横向滚动）
+> - **插话发送**：面板内模型运行中发送自动走 steer（可即时提醒/纠正），steer 不可用时降级 queue
+> - **拖拽修复**：修复 HTML5 DnD 在 dragover 阶段读不到数据导致的「拖不动」问题
+>
+> 安装本 fork：`dsh plugin --profile web add github:zhenlixiaoqiang-png/multiple-chat-panels-dps`
+>
+> ---
+
 Multiple chat panels for DeepSeek Harness: view and interact with several Agents side by side.
 
 Terminal-native Agents (like Claude Code) give you a “god’s-eye view”: you can watch and steer multiple conversations at once, and interact with several Agents in parallel. Most desktop and web harnesses don’t offer this: you either work with a single Agent in a single conversation, or you juggle multiple windows and quickly lose context.
